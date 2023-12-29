@@ -1,0 +1,860 @@
+from __future__ import annotations
+
+from typing import List
+
+import gymnasium as gym
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import math
+from gymnasium import spaces
+from gymnasium.utils import seeding
+from stable_baselines3.common.vec_env import DummyVecEnv
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+import warnings
+warnings.filterwarnings('ignore')
+
+
+matplotlib.use("Agg")
+
+# from stable_baselines3.common.logger import Logger, KVWriter, CSVOutputFormat
+
+
+class StockTradingEnv(gym.Env):
+    """A stock trading environment for OpenAI gym"""
+
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        stock_dim: int,
+        hmax: int,
+        initial_amount: int,
+        num_stock_shares: list[int],
+        commission_per_trade: float,
+        reward_scaling: float,
+        state_space: int,
+        action_space: int,
+        tech_indicator_list: list[str],
+        turbulence_threshold=None,
+        risk_indicator_col="turbulence",
+        max_risk_per_trade = float,
+        min_rr_ratio = float,
+        make_plots: bool = False,
+        print_verbosity=10,
+        initial=True,
+        model_name="",
+        mode="",
+        iteration="",
+        previous_state=[],
+         day= 0,
+    ):
+        self.day = day
+        self.df = df
+        self.stock_dim = stock_dim
+        self.hmax = hmax
+        self.num_stock_shares = num_stock_shares
+        self.initial_amount = initial_amount  # get the initial cash
+        self.commission_per_trade = commission_per_trade
+        self.reward_scaling = reward_scaling
+        self.state_space = state_space
+        self.action_space = action_space
+        self.tech_indicator_list = tech_indicator_list
+        #print('self.tech_indicator_list in init:',self.tech_indicator_list)
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.action_space,))
+        #print('self.state_space in StockTardingEnv:', self.state_space)
+        #self.action_space = spaces.Box(low=-1, high=1, shape=(1,))
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_space,))
+        #print('self.observation_space in StockTardingEnv:', self.observation_space)
+        #self.observation_space = spaces.Box(low=-1, high=1, shape=(1,))
+        #print('Printing self.data.index:',self.df.index)
+        #print('Printing self.data.iloc[0]:',self.df.iloc[0], self.df.Close )
+
+        #print("self.day:", self.day)
+        #self.data = self.df.loc[self.day, :]
+        self.data = self.df.iloc[self.day, :]
+
+        self.terminal = False
+        self.make_plots = make_plots
+        self.print_verbosity = print_verbosity
+        self.turbulence_threshold = turbulence_threshold
+        self.risk_indicator_col = risk_indicator_col
+        self.initial = initial
+        self.model_name = model_name
+        self.mode = mode
+        self.iteration = iteration
+        self.previous_state = previous_state
+
+        # initalize state
+        self.state = self._initiate_state()
+
+        #initialize perforance metrics
+        self.max_drawdown = None
+        self.max_money_drawdown = None
+        self.sharpe = None
+        self.rewards_memory = []
+
+        # Initialize take-profit and stop-loss levels for buy and sell trades
+        self.take_profit_buy = 0.0
+        self.stop_loss_buy = 0.0
+        self.take_profit_sell = 0.0
+        self.stop_loss_sell = 0.0
+        self.max_risk_per_trade = max_risk_per_trade
+        self.min_rr_ratio = min_rr_ratio
+
+        # initialize reward
+        self.reward = 0
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+        self.episode = 0
+        # memorize all the total balance change
+        self.asset_memory = [
+            self.initial_amount
+            + np.sum(
+                np.array(self.num_stock_shares)
+                * np.array(self.state[1 : 1 + self.stock_dim])
+            )
+        ]  # the initial total asset is calculated by cash + sum (num_share_stock_i * price_stock_i)
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = (
+            []
+        )  # we need sometimes to preserve the state in the middle of trading process
+        self.date_memory = [self._get_date()]
+        #self.logger = Logger('results',[CSVOutputFormat])
+        # self.reset()
+        self._seed()
+
+    def _sell_stock(self, index, action):
+        def _do_sell_normal():
+            if self.state[index + 2 * self.stock_dim + 1] != True:
+                if self.state[index + self.stock_dim + 1] > 0:
+                    sell_num_shares = min(
+                        abs(action), self.state[index + self.stock_dim + 1]
+                    )
+                    # Calculate the sell amount with fixed commission
+                    sell_amount = (
+                        self.state[index + 1] * sell_num_shares - self.commission_per_trade
+                    )
+                    self.state[0] += sell_amount
+                    self.state[index + self.stock_dim + 1] -= sell_num_shares
+                    self.cost += self.commission_per_trade
+                    self.trades += 1
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = 0
+
+            return sell_num_shares
+        # perform sell action based on the sign of the action
+        if self.turbulence_threshold is not None:
+            if self.turbulence >= self.turbulence_threshold:
+                if self.state[index + 1] > 0:
+                    # Sell only if the price is > 0 (no missing data in this particular date)
+                    # if turbulence goes over threshold, just clear out all positions
+                    if self.state[index + self.stock_dim + 1] > 0:
+                        # Sell only if current asset is > 0
+                        sell_num_shares = self.state[index + self.stock_dim + 1]
+                        sell_amount = (
+                            self.state[index + 1]
+                            * sell_num_shares
+                            * (1 - self.commission_per_trade)
+                        )
+                        # update balance
+                        self.state[0] += sell_amount
+                        self.state[index + self.stock_dim + 1] = 0
+                        self.cost += (
+                            self.state[index + 1]
+                            * sell_num_shares
+                            * self.commission_per_trade
+                        )
+                        self.trades += 1
+                    else:
+                        sell_num_shares = 0
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = _do_sell_normal()
+        else:
+            sell_num_shares = _do_sell_normal()
+
+        return sell_num_shares
+
+    def _buy_stock(self, index, action):
+        def _do_buy():
+            if self.state[index + 2 * self.stock_dim + 1] != True:
+
+                available_amount = self.state[0] // (
+                    self.state[index + 1] * (1 + self.commission_per_trade)
+                )
+                buy_num_shares = min(available_amount, action)
+                # Calculate the buy amount with fixed commission
+                buy_amount = (
+                    self.state[index + 1] * buy_num_shares + self.commission_per_trade
+                )
+                self.state[0] -= buy_amount
+                self.state[index + self.stock_dim + 1] += buy_num_shares
+                self.cost += self.commission_per_trade
+                self.trades += 1
+            else:
+                buy_num_shares = 0
+
+            return buy_num_shares
+        # perform buy action based on the sign of the action
+        if self.turbulence_threshold is None:
+            buy_num_shares = _do_buy()
+        else:
+            if self.turbulence < self.turbulence_threshold:
+                buy_num_shares = _do_buy()
+            else:
+                buy_num_shares = 0
+                pass
+
+        return buy_num_shares
+
+    def _make_plot(self):
+        plt.plot(self.asset_memory, "r")
+        plt.savefig(f"results/account_value_trade_{self.episode}.png")
+        plt.close()
+
+    def step(self, actions):
+        self.terminal = self.day >= len(self.df.index.unique()) - 1
+        if not self.terminal:
+
+            closing_price = self.data.Close
+            take_profit_buy = self.data['PROFITBUY']
+            stop_loss_buy = self.data['STOPLOSSBUY']
+            take_profit_sell = self.data['PROFITSELL']
+            stop_loss_sell = self.data['STOPLOSSSELL']
+
+            # Check take-profit and stop-loss conditions for each stock
+            for i in range(self.stock_dim):
+                if actions[i] > 0 and closing_price > take_profit_buy:
+                    actions[i] = -self.hmax * 0.5  # Sell based on take-profit condition
+                elif actions[i] > 0 and closing_price < stop_loss_buy:
+                    actions[i] = -self.hmax * 0.5  # Sell based on stop-loss condition
+                elif actions[i] < 0 and closing_price > take_profit_sell:
+                    actions[i] = self.hmax * 0.5  # Buy based on take-profit condition
+                elif actions[i] < 0 and closing_price < stop_loss_sell:
+                    actions[i] = self.hmax * 0.5  # Buy based on stop-loss condition
+
+            actions = actions * self.hmax  # actions initially scaled between 0 to 1
+            actions = actions.astype(int)
+
+        if self.terminal:
+            if self.make_plots:
+                self._make_plot()
+            #print(f"Initial State: {self.state}")
+            end_total_asset = self.state[0] + sum(
+                np.array(self.state[1 : (self.stock_dim + 1)])
+                * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+            )
+            #print('self.asset_memory', self.asset_memory)
+            end_total_asset = end_total_asset - self.cost
+            df_total_value = pd.DataFrame(self.asset_memory)
+            tot_reward = (
+                self.state[0]
+                + sum(
+                    np.array(self.state[1 : (self.stock_dim + 1)])
+                    * np.array(
+                        self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]
+                    )
+                )
+                - self.initial_amount
+            )  # initial_amount is only cash part of our initial asset
+
+            df_total_value.columns = ["account_value"]
+            df_total_value["Date"] = self.date_memory
+            df_total_value["daily_return"] = df_total_value["account_value"].pct_change(
+                1
+            )
+            if df_total_value["daily_return"].std() != 0:
+                sharpe = (
+                    (252**0.5)
+                    * df_total_value["daily_return"].mean()
+                    / df_total_value["daily_return"].std()
+                )
+            tot_profit = end_total_asset - self.initial_amount
+            df_rewards = pd.DataFrame(self.rewards_memory)
+            df_rewards.columns = ["account_rewards"]
+            df_rewards["Date"] = self.date_memory[:-1]
+            if self.episode % self.print_verbosity == 0:
+                print(f"day: {self.day}, episode: {self.episode}")
+                #print(f"begin_total_asset: {self.asset_memory[1]:0.2f}")
+                print(f"initial_amount: {self.initial_amount:0.2f}")
+                print(f"end_total_asset: {end_total_asset:0.2f}")
+                print(f"total_reward: {tot_reward:0.2f}")
+                print(f"total_cost: {self.cost:0.2f}")
+                print(f"total_profit: {tot_profit:0.2f}")
+                print(f"total_trades: {self.trades}")
+                if df_total_value["daily_return"].std() != 0:
+                    print(f"Sharpe: {sharpe:0.3f}")
+                print("=================================")
+
+            if (self.model_name != "") and (self.mode != ""):
+                df_actions = self.save_action_memory()
+                df_actions.to_csv(
+                    "results/actions_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration
+                    )
+                )
+                df_total_value.to_csv(
+                    "results/account_value_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration
+                    ),
+                    index=False,
+                )
+                df_rewards.to_csv(
+                    "results/account_rewards_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration
+                    ),
+                    index=False,
+                )
+                plt.plot(self.asset_memory, "r")
+                plt.savefig(
+                    "results/account_value_{}_{}_{}.png".format(
+                        self.mode, self.model_name, self.iteration
+                    )
+                )
+                plt.close()
+
+            # Add outputs to logger interface
+            # logger.record("environment/portfolio_value", end_total_asset)
+            # logger.record("environment/total_reward", tot_reward)
+            # logger.record("environment/total_reward_pct", (tot_reward / (end_total_asset - tot_reward)) * 100)
+            # logger.record("environment/total_cost", self.cost)
+            # logger.record("environment/total_trades", self.trades)
+
+            return self.state, self.reward, self.terminal, False, {}
+
+        else:
+
+            actions = actions * self.hmax  # actions initially is scaled between 0 to 1
+            actions = actions.astype(
+                int
+            )  # convert into integer because we can't by fraction of shares
+
+            # Check if a new trade is initiated and save take-profit and stop-loss levels
+            if np.any(actions > 0):
+                # Buy trade initiated, save take-profit and stop-loss levels
+                self.take_profit_buy = self.data['PROFITBUY']
+                self.stop_loss_buy = self.data['STOPLOSSBUY']
+
+            elif np.any(actions < 0):
+                # Sell trade initiated, save take-profit and stop-loss levels
+                self.take_profit_sell = self.data['PROFITSELL']
+                self.stop_loss_sell = self.data['STOPLOSSSELL']
+
+            if self.turbulence_threshold is not None:
+                if self.turbulence >= self.turbulence_threshold:
+                    actions = np.array([-self.hmax] * self.stock_dim)
+            begin_total_asset = self.state[0] + sum(
+                np.array(self.state[1 : (self.stock_dim + 1)])
+                * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+            )
+            #print("begin_total_asset:{}".format(begin_total_asset))
+
+            argsort_actions = np.argsort(actions)
+            sell_index = argsort_actions[: np.where(actions < 0)[0].shape[0]]
+            buy_index = argsort_actions[::-1][: np.where(actions > 0)[0].shape[0]]
+
+            for index in sell_index:
+                risk_per_trade_sell = self.data['RiskPerTradeRatioSELL']
+                rr_ratio_sell = self.data['RRRatioSELL']
+                if (risk_per_trade_sell <= self.max_risk_per_trade) and (rr_ratio_sell >= self.min_rr_ratio):
+                    # code for selling actions
+                    actions[index] = self._sell_stock(index, actions[index]) * (-1)
+                    # print(f'take sell action after : {actions[index]}')
+                    # print(f"Num shares after: {self.state[index+self.stock_dim+1]}")
+
+            for index in buy_index:
+                risk_per_trade_buy = self.data['RiskPerTradeRatioBUY']
+                rr_ratio_buy = self.data['RRRatioBUY']
+                if (risk_per_trade_buy <= self.max_risk_per_trade) and (rr_ratio_buy >= self.min_rr_ratio):
+                    # code for buying actions
+                    actions[index] = self._buy_stock(index, actions[index])
+
+            self.actions_memory.append(actions)
+
+            # state: s -> s+1
+            self.day += 1
+            #self.data = self.df.loc[self.day, :]
+            self.data = self.df.iloc[self.day, :]
+            if self.turbulence_threshold is not None:
+                if len(self.df.tic.unique()) == 1:
+                    self.turbulence = self.data[self.risk_indicator_col]
+                elif len(self.df.tic.unique()) > 1:
+                    self.turbulence = self.data[self.risk_indicator_col].values[0]
+            self.state = self._update_state()
+
+            end_total_asset = self.state[0] + sum(
+                np.array(self.state[1 : (self.stock_dim + 1)])
+                * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+            )
+            end_total_asset = end_total_asset - self.cost
+            #print("end_total_asset:{}".format(end_total_asset))
+            #print('Cost:', self.cost)
+
+            # Calculate drawdown penalty
+            max_drawdown_penalty = -0.1 * self.calculate_max_drawdown() / self.hmax  # Adjust the coefficient as needed
+
+            # Calculate Sharpe ratio incentive
+            sharpe_incentive = 0.1 * self.calculate_sharpe_ratio() / self.hmax  # Adjust the coefficient as needed
+            #sharpe_incentive = 0.1 * self.calculate_sharpe_ratio() # Adjust the coefficient as needed
+            # Calculate transaction cost penalty
+            transaction_cost_penalty = -self.cost * 0.001 / self.hmax # we use 0.001 as coefficient adjust as needed
+
+            # Calculate portfolio volatility
+            portfolio_returns = np.diff(self.asset_memory) / self.asset_memory[:-1]
+            portfolio_volatility = np.std(portfolio_returns)
+
+            # Introduce volatility penalty
+            volatility_penalty = -0.1 * portfolio_volatility / self.hmax # we use -0.1 as coefficient adjust as needed
+
+            # Calculate exploration bonus based on action distribution entropy
+            action_probs = np.abs(actions) / np.sum(np.abs(actions) + 1e-8)  # Add small constant to avoid division by zero
+            entropy = -np.sum(action_probs * np.log(action_probs + 1e-8))
+            exploration_bonus = 0.01 * entropy / self.hmax  # Adjust the coefficient as needed
+
+            # Experiment with scaling factors
+            weight_factor_profit_loss = self.dynamic_coefficient_based_on_performance() #calculating dynamic coefficient based on agent's performance
+            weight_factor_volatility = self.dynamic_coefficient_based_on_volatility()#calculating dynamic coefficient based on Market's volatility
+            weight_factor_transaction_cost = self.dynamic_coefficient_based_on_transaction_cost()#calculating dynamic coefficient based on transaction_cost
+            weight_factor_drawdown = self.dynamic_coefficient_based_on_drawdown()#calculating dynamic coefficient based on max drawdown
+            weight_factor_sharpe = self.dynamic_coefficient_based_on_sharpe()#calculating dynamic coefficient based on sharpe ratio
+            weight_factor_exploration = self.dynamic_coefficient_based_on_exploration(actions) #calculating dynamic coefficient based on exploration bonus
+
+            # Check consecutive good or bad trades
+            if len(self.actions_memory) >= 3:
+                # Check for 3 or more consecutive bad trades
+                if all(action < 0 for action in self.actions_memory[-3:]):
+                    consecutive_bad_trade_penalty = -0.2 / self.hmax  # Adjust the coefficient as needed
+                    self.reward += consecutive_bad_trade_penalty
+                # Check for 2 or more consecutive good trades
+                elif all(action > 0 for action in self.actions_memory[-2:]):
+                    consecutive_good_trade_reward = 0.2 / self.hmax  # Adjust the coefficient as needed
+                    self.reward += consecutive_good_trade_reward
+
+            self.asset_memory.append(end_total_asset)
+            self.date_memory.append(self._get_date())
+
+            self.reward = (weight_factor_profit_loss * (end_total_asset - begin_total_asset) +
+                        weight_factor_transaction_cost * transaction_cost_penalty +
+                        weight_factor_drawdown * max_drawdown_penalty  +
+                        weight_factor_sharpe * sharpe_incentive+
+                        weight_factor_exploration * exploration_bonus
+                          )
+
+            #self.reward = (end_total_asset - begin_total_asset)
+            # Normalize the total reward
+            #self.reward /= self.hmax
+
+            self.rewards_memory.append(self.reward)
+            self.reward = self.reward * self.reward_scaling
+            self.state_memory.append(
+                self.state
+            )  # add current state in state_recorder for each step
+
+        return self.state, self.reward, self.terminal, False, {}
+
+    def reset(self, *, seed=None, options=None):
+        self.day = 0
+        self.data = self.df.iloc[self.day, :]
+        self.state = self._initiate_state()
+        if self.initial:
+            self.asset_memory = [
+                self.initial_amount
+                + np.sum(
+                    np.array(self.num_stock_shares)
+                    * np.array(self.state[1 : 1 + self.stock_dim])
+                )
+            ]
+        else:
+            if self.previous_state is not None and self.previous_state[0] is not None:
+                self.initial_amount = self.previous_state[0]
+                previous_total_asset = self.initial_amount + sum(
+                    np.array(self.state[1 : (self.stock_dim + 1)])
+                    * np.array(
+                        self.previous_state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]
+                    )
+                )
+                self.asset_memory = [previous_total_asset]
+            else:
+                # Handle the case where self.previous_state is None or [None]
+                self.asset_memory = [self.initial_amount]
+
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+        self.terminal = False
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.date_memory = [self._get_date()]
+
+        self.episode += 1
+
+        return np.array(self.state), {}  # Ensure the first element of the return tuple is a valid observation
+
+
+    def render(self, mode="human", close=False):
+        return self.state
+
+    def _initiate_state(self):
+        if self.initial:
+            # For Initial State
+            if len(self.df.tic.unique()) > 1:
+                # for multiple stock
+                state = (
+                    [self.initial_amount]
+                    + self.data.Close.values.tolist()
+                    + self.num_stock_shares
+                    + sum(
+                        (
+                            self.data[tech].values.tolist()
+                            for tech in self.tech_indicator_list
+                        ),
+                        [],
+                    )
+                )  # append initial stocks_share to initial state, instead of all zero
+            else:
+                # for single stock
+                state = (
+                    [self.initial_amount]
+                    + [self.data.Close]
+                    + [0] * self.stock_dim
+                    + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                )
+        else:
+            # Using Previous State
+            if len(self.df.tic.unique()) > 1:
+                # for multiple stock
+                state = (
+                    [self.previous_state[0]]
+                    + self.data.Close.values.tolist()
+                    + self.previous_state[
+                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
+                    ]
+                    + sum(
+                        (
+                            self.data[tech].values.tolist()
+                            for tech in self.tech_indicator_list
+                        ),
+                        [],
+                    )
+                )
+            else:
+                # for single stock
+                state = (
+                    [self.previous_state[0]]
+                    + [self.data.Close]
+                    + self.previous_state[
+                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
+                    ]
+                    + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                )
+        # Reset take-profit and stop-loss levels for buy and sell trades when initializing state
+        self.take_profit_buy = 0.0
+        self.stop_loss_buy = 0.0
+        self.take_profit_sell = 0.0
+        self.stop_loss_sell = 0.0
+        return state
+
+    def _update_state(self):
+        if len(self.df.tic.unique()) > 1:
+            # for multiple stock
+            state = (
+                [self.state[0]]
+                + self.data.Close.values.tolist()
+                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+                + sum(
+                    (
+                        self.data[tech].values.tolist()
+                        for tech in self.tech_indicator_list
+                    ),
+                    [],
+                )
+            )
+
+        else:
+            # for single stock
+            state = (
+                [self.state[0]]
+                + [self.data.Close]
+                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+                + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+            )
+
+        return state
+
+    def _get_date(self):
+        if len(self.df.tic.unique()) > 1:
+            Date = self.data.Date.unique()[0]
+        else:
+            Date = self.data.Date
+        return Date
+
+    # add save_state_memory to preserve state in the trading process
+    def save_state_memory(self):
+        if len(self.df.tic.unique()) > 1:
+            # date and close price length must match actions length
+            date_list = self.date_memory[:-1]
+            df_date = pd.DataFrame(date_list)
+            df_date.columns = ["Date"]
+
+            state_list = self.state_memory
+            df_states = pd.DataFrame(
+                state_list,
+                columns=[
+                    "cash",
+                    "Bitcoin_price",
+                    "Gold_price",
+                    "Bitcoin_num",
+                    "Gold_num",
+                    "Bitcoin_Disable",
+                    "Gold_Disable",
+                ],
+            )
+            df_states.index = df_date.Date
+            # df_actions = pd.DataFrame({'date':date_list,'actions':action_list})
+        else:
+            date_list = self.date_memory[:-1]
+            state_list = self.state_memory
+            df_states = pd.DataFrame({"Date": date_list, "states": state_list})
+        # print(df_states)
+        return df_states
+
+    def save_asset_memory(self):
+        date_list = self.date_memory
+        asset_list = self.asset_memory
+        # print(len(date_list))
+        # print(len(asset_list))
+        df_account_value = pd.DataFrame(
+            {"Date": date_list, "account_value": asset_list}
+        )
+        return df_account_value
+
+    def save_action_memory(self):
+        if len(self.df.tic.unique()) > 1:
+            # date and close price length must match actions length
+            date_list = self.date_memory[:-1]
+            df_date = pd.DataFrame(date_list)
+            df_date.columns = ["Date"]
+
+            action_list = self.actions_memory
+            df_actions = pd.DataFrame(action_list)
+            df_actions.columns = self.data.tic.values
+            df_actions.index = df_date.Date
+            # df_actions = pd.DataFrame({'date':date_list,'actions':action_list})
+        else:
+            date_list = self.date_memory[:-1]
+            action_list = self.actions_memory
+            df_actions = pd.DataFrame({"Date": date_list, "actions": action_list})
+        return df_actions
+
+    def calculate_max_drawdown(self):
+        if len(self.asset_memory) > 0:
+            max_asset_value = np.maximum.accumulate(self.asset_memory)
+            drawdowns = (self.asset_memory - max_asset_value) / max_asset_value
+            max_drawdown = -np.min(drawdowns)  # Negate the minimum drawdown
+            return max_drawdown
+        return 0
+
+    def calculate_max_money_drawdown(self):
+        if len(self.asset_memory) > 0:
+            max_asset_value = np.maximum.accumulate(self.asset_memory)
+            money_drawdowns = max_asset_value - self.asset_memory
+            max_money_drawdown = np.max(money_drawdowns)
+            return max_money_drawdown
+        return 0
+
+    def calculate_average_reward(self, num_episodes):
+        if len(self.rewards_memory) < num_episodes:
+            return np.mean(self.rewards_memory)
+        else:
+            return np.mean(self.rewards_memory[-num_episodes:])
+
+    def calculate_sharpe_ratio(self):
+        if len(self.asset_memory) <= 1:
+            return 0
+
+        returns = np.diff(self.asset_memory) / self.asset_memory[:-1]
+        std_dev = np.std(returns)
+
+        if std_dev == 0:
+            # Handle the case where standard deviation is zero
+            return 0  # or return a default value, depending on your requirements
+
+        sharpe = np.sqrt(252) * np.mean(returns) / std_dev
+
+        return sharpe
+
+
+    def calculate_portfolio_volatility(self):
+        # Implement logic to calculate portfolio volatility
+        # For example, you can use the historical returns of the portfolio
+        portfolio_returns = np.diff(self.asset_memory) / self.asset_memory[:-1]
+        portfolio_volatility = np.std(portfolio_returns)
+        return portfolio_volatility
+
+    def calculate_sterling_ratio(self):
+        if len(self.asset_memory) <= 1:
+            return 0
+        returns = np.diff(self.asset_memory) / self.asset_memory[:-1]
+        risk_free_rate = 0.02  # Assuming a risk-free rate of 2%, you can adjust this value
+        excess_returns = returns - risk_free_rate
+        negative_returns = excess_returns[excess_returns < 0]
+        std_dev_negative_returns = np.std(negative_returns)
+
+        if std_dev_negative_returns == 0:
+            # Handle the case where standard deviation of negative returns is zero
+            return 0  # or return a default value, depending on your requirements
+        sterling_ratio = np.mean(excess_returns) / std_dev_negative_returns
+        return sterling_ratio
+
+    def get_sharpe_ratio(self):
+        if self.sharpe is None:
+            self.sharpe = self.calculate_sharpe_ratio()
+        return self.sharpe
+
+    def get_max_drawdown(self):
+        if self.max_drawdown is None:
+            self.max_drawdown = self.calculate_max_drawdown()
+        return self.max_drawdown
+
+    def get_max_money_drawdown(self):
+        if self.max_money_drawdown is None:
+            self.max_money_drawdown = self.calculate_max_money_drawdown()
+        return self.max_money_drawdown
+
+    def get_average_reward(self):
+        return np.mean(self.rewards_memory)
+
+    def dynamic_coefficient_based_on_performance(self):
+        # Get relevant performance metrics
+        #total_reward = sum(self.rewards_memory)
+        total_reward = average_reward = self.get_average_reward()
+        # Define target values or ranges for performance metrics
+        target_total_reward = 10  # Adjust as needed
+        # Define coefficient adjustment factors
+        reward_coefficient_factor = 0.1
+        # Initialize coefficients
+        reward_coefficient = 2.0 # default value 2.0
+
+        # Adjust coefficients based on performance metrics
+        if total_reward < target_total_reward:
+            reward_coefficient *= (1 + reward_coefficient_factor)
+        else:
+            reward_coefficient /= (1 + reward_coefficient_factor)
+        return reward_coefficient
+
+    def dynamic_coefficient_based_on_sharpe(self):
+        # Get relevant performance metric
+        sharpe_ratio = self.calculate_sharpe_ratio()
+
+        # Define target value or range for Sharpe ratio
+        target_sharpe_ratio = 0.2  # Adjust as needed 0.5 as default
+
+        # Define coefficient adjustment factor
+        sharpe_coefficient_factor = 0.1
+
+        # Initialize coefficient
+        sharpe_coefficient = 1.0
+
+        # Adjust coefficient based on Sharpe ratio
+        if sharpe_ratio < target_sharpe_ratio:
+            sharpe_coefficient *= (1 + sharpe_coefficient_factor)
+        else:
+            sharpe_coefficient /= (1 + sharpe_coefficient_factor)
+
+        return sharpe_coefficient
+
+
+    def dynamic_coefficient_based_on_volatility(self):
+        # Get relevant performance metric
+        portfolio_volatility = self.calculate_portfolio_volatility()
+        # Define target value or range for portfolio volatility
+        target_volatility = 0.2  # Adjust as needed
+        # Define coefficient adjustment factor
+        volatility_coefficient_factor = 0.1
+        # Initialize coefficient
+        volatility_coefficient = 1.0
+
+        # Adjust coefficient based on portfolio volatility
+        if portfolio_volatility > target_volatility:
+            volatility_coefficient *= (1 + volatility_coefficient_factor)
+        else:
+            volatility_coefficient /= (1 + volatility_coefficient_factor)
+
+        return volatility_coefficient
+
+    def dynamic_coefficient_based_on_transaction_cost(self):
+        # Get relevant performance metric
+        transaction_cost = self.cost
+        # Define target value or range for transaction cost
+        target_transaction_cost = 0.005  # Adjust as needed
+        # Define coefficient adjustment factor
+        transaction_cost_coefficient_factor = 0.1
+        # Initialize coefficient
+        transaction_cost_coefficient = 1.0
+
+        # Adjust coefficient based on transaction cost
+        if transaction_cost > target_transaction_cost:
+            transaction_cost_coefficient *= (1 + transaction_cost_coefficient_factor)
+        else:
+            transaction_cost_coefficient /= (1 + transaction_cost_coefficient_factor)
+
+        return transaction_cost_coefficient
+
+    def dynamic_coefficient_based_on_drawdown(self):
+        # Get relevant performance metric
+        max_drawdown = self.calculate_max_drawdown()
+        # Define target value or range for maximum drawdown
+        target_max_drawdown = 0.1  # Adjust as needed
+        # Define coefficient adjustment factor
+        drawdown_coefficient_factor = 0.1
+        # Initialize coefficient
+        drawdown_coefficient = 1.0
+
+        # Adjust coefficient based on maximum drawdown
+        if max_drawdown > target_max_drawdown:
+            drawdown_coefficient *= (1 + drawdown_coefficient_factor)
+        else:
+            drawdown_coefficient /= (1 + drawdown_coefficient_factor)
+
+        return drawdown_coefficient
+
+    def dynamic_coefficient_based_on_exploration(self, actions):
+        # Calculate exploration bonus based on action distribution entropy
+        action_probs = np.abs(actions) / (np.sum(np.abs(actions)) + 1e-8)  # Add small constant to avoid division by zero
+        entropy = -np.sum(action_probs * np.log(action_probs + 1e-8))
+        exploration_bonus = 0.01 * entropy / self.hmax  # Adjust the coefficient as needed
+
+        # Define target value or range for exploration bonus
+        target_exploration_bonus = 0.01  # Adjust as needed
+        # Define coefficient adjustment factor
+        exploration_coefficient_factor = 0.1
+        # Initialize coefficient
+        exploration_coefficient = 1.0
+
+        # Adjust coefficient based on exploration bonus
+        if exploration_bonus < target_exploration_bonus:
+            exploration_coefficient *= (1 + exploration_coefficient_factor)
+        else:
+            exploration_coefficient /= (1 + exploration_coefficient_factor)
+
+
+        return exploration_coefficient
+
+
+    def _seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def get_sb_env(self):
+        e = DummyVecEnv([lambda: self])
+        obs = e.reset()
+        return e, obs
