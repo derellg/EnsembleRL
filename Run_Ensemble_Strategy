@@ -1,0 +1,140 @@
+#from finrl.agents.stablebaselines3.models import DRLAgent,DRLEnsembleAgent
+import datetime
+from pprint import pprint
+import itertools
+import sys
+sys.path.append('../FinRL-Library')
+import os
+
+DATA_SAVE_DIR = "datasets"
+TRAINED_MODEL_DIR = "trained_models"
+TENSORBOARD_LOG_DIR = "tensorboard_log"
+RESULTS_DIR = "results"
+
+def check_and_make_directories(directories: list[str]):
+    for directory in directories:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+check_and_make_directories([DATA_SAVE_DIR, TRAINED_MODEL_DIR, TENSORBOARD_LOG_DIR, RESULTS_DIR])
+
+# Load your MNQ historical financial data
+#mnq_data = pd.read_csv('experiment_ibm.csv')  # MNQ data file
+# Read the CSV file into the DataFrame
+#mnq_data = pd.read_csv('backtrader_ibm.csv')
+#mnq_data = pd.read_csv('experiment_turbulance')
+mnq_data = pd.read_csv('/content/experiment_turbulance.csv')
+'''
+mnq_data = mnq_data[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'tic',
+                     'SELL', 'BUY','MACD', 'SMA10','SMA30', 'SMA50', 'SMA200',
+                     'RSI', 'MFI3', 'MFI', 'WillR', 'ADX','ADX14', 'ADX7', 'CMF',
+                     'CCI', 'EMA5', 'EMA9', 'EMA20', 'EMA200','Fibonacci', 'Lagged_RSI',
+                     'RSI_Divergence', 'Price_ROC', 'K', 'D','SupertrendSignal', 'Engulfing',
+                     'Harami', 'Doji', 'Trendline','RSITrendline', 'VWAP', 'TrendlineSignal',
+                     'RSITrendlineSignal','StochasticSignal', 'MFISignal', 'CandleSignal',
+                     'Bullish_Crossover','Upper', 'Middle', 'Lower', 'BollingerBandsWidth',
+                     'BBandsSignal','Pivot', 'R1', 'S1', 'R2', 'S2', 'R3', 'S3', 'ATR', 'PROFITBUY',
+                     'STOPLOSSBUY', 'PROFITSELL', 'STOPLOSSSELL', 'TrendlineSignal15mn',
+                     'SupertrendSignal15mn', 'RSITrendlineSignal15mn', 'CandleSignal15mn',
+                     'BBandsSignal30mn', 'StochasticSignal1hr', 'TrendlineSignal1hr',
+                     'PivotSignal1hr', 'MFISignal1hr', 'BBandsSignal1hr', 'VWAPSignal1hr',
+                     'VWAPSignal', 'BBandsSignal4hrs', 'PivotSignal4hrs', 'MFISignal4hrs',
+                     'VWAPSignal4hrs', 'TrendlineSignal4hr', 'StochasticSignal4hr',
+                     'RiskPerTradeRatioBUY', 'RRRatioBUY', 'RiskPerTradeRatioSELL',
+                     'RRRatioSELL', 'DayOfWeek', 'turbulence']]
+'''
+# Check if "Signals" column exists before dropping it
+if 'Unnamed: 0' in mnq_data.columns:
+    mnq_data.drop('Unnamed: 0', axis=1, inplace=True)
+    print("Column 'Unnamed: 0' deleted.")
+else:
+    print("Column 'Unnamed: 0' not found.")
+
+# Check if "Signals" column exists before dropping it
+if 'Signals' in mnq_data.columns:
+    mnq_data.drop('Signals', axis=1, inplace=True)
+    print("Column 'Signals' deleted.")
+else:
+    print("Column 'Signals' not found.")
+
+# Define your start date as the first date available in the dataset
+start_date = mnq_data['Date'].min()
+
+# Define your end date as the maximum date available in the dataset
+end_date = mnq_data['Date'].max()
+
+# Calculate the date range for 80% training and 20% validation
+date_range = pd.date_range(start_date, end_date)
+
+# Calculate the index to split the data
+split_index = int(0.8 * len(date_range))
+DATE_FORMAT = "%Y-%m-%d"
+
+TRAIN_START_DATE = str(date_range[0])
+TRAIN_END_DATE = str(date_range[split_index])
+TEST_START_DATE = str(date_range[split_index])
+TEST_END_DATE = str(date_range[-1])
+
+stock_dimension = len(mnq_data.tic.unique())
+tech_indicator_list =  mnq_data.columns[9:].tolist()
+state_space = 1 + 2*stock_dimension + len(tech_indicator_list)*stock_dimension
+
+# Create environment settings
+env_kwargs = {
+    "initial_amount": 100000,
+    'max_risk_per_trade': 0.75,
+    'min_rr_ratio' : 3,
+    "reward_scaling": 1e-4,
+    'num_stock_shares': 1,
+    "commission_per_trade": 1.50,
+    "print_verbosity": 5,
+    "hmax": 1,
+    #"state_space": len(mnq_data.columns),
+    "state_space": state_space,
+    "stock_dim": 1,
+    "tech_indicator_list": mnq_data.columns[9:].tolist(),
+    "action_space": 1,
+}
+
+rebalance_window = 63 # rebalance_window is the number of days in 5 minutes to retrain the model
+validation_window = 63 # validation_window is the number of days in 5 minutes to do validation and trading (e.g. if validation_window=63, then both validation and trading period will be 63 days)
+rolling_window_size = 63
+
+ensemble_agent = DRLEnsembleAgent(df= mnq_data,
+                 train_period=(TRAIN_START_DATE,TRAIN_END_DATE),
+                 val_test_period=(TEST_START_DATE,TEST_END_DATE),
+                 rebalance_window=rebalance_window,
+                 validation_window=validation_window,
+                 **env_kwargs)
+A2C_model_kwargs = {
+    'n_steps': 5,
+    'ent_coef': 0.005,
+    'learning_rate': 0.0007
+}
+
+PPO_model_kwargs = {
+    "ent_coef": 0.01,
+    "n_steps": 2048,
+    "learning_rate": 0.00025,
+    "batch_size": 128
+}
+
+DDPG_model_kwargs = {
+    #"action_noise":"ornstein_uhlenbeck",
+    "buffer_size": 100,  # Corrected from "1_00" to "100"
+    "learning_rate": 0.0005,
+    "batch_size": 8
+}
+
+timesteps_dict = {'a2c' : 1000,
+                 'ppo' : 5000,
+                 'ddpg' : 100
+                 }
+
+
+df_summary = ensemble_agent.run_ensemble_strategy(rolling_window_size,
+                                                 A2C_model_kwargs,
+                                                 PPO_model_kwargs,
+                                                 DDPG_model_kwargs,
+                                                 timesteps_dict
+                                                 )
