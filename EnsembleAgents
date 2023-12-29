@@ -1,0 +1,892 @@
+import time
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+from stable_baselines3 import A2C
+from stable_baselines3 import DDPG
+from stable_baselines3 import PPO
+from stable_baselines3 import SAC
+from stable_baselines3 import TD3
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.noise import NormalActionNoise
+from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
+from stable_baselines3.common.vec_env import DummyVecEnv
+import config
+#import meta.config
+#from memory_profiler import profile
+
+
+# RL models from stable-baselines
+MODELS = {"a2c": A2C, "ddpg": DDPG, "td3": TD3, "sac": SAC, "ppo": PPO}
+#MODEL_KWARGS = {x: config.__dict__[f"{x.upper()}_PARAMS"] for x in MODELS.keys()}
+
+NOISE = {
+    "normal": NormalActionNoise,
+    "ornstein_uhlenbeck": OrnsteinUhlenbeckActionNoise,
+}
+
+class TensorboardCallback(BaseCallback):
+    """
+    Custom callback for plotting additional values in tensorboard.
+    """
+
+    def __init__(self, verbose=10):
+        super(TensorboardCallback, self).__init__(verbose)
+
+    def _on_step(self) -> bool:
+        try:
+            self.logger.record(key="train/reward", value=self.locals["rewards"][0])
+        except BaseException:
+            self.logger.record(key="train/reward", value=self.locals["reward"][0])
+        return True
+
+class EnsembleModel:
+    def __init__(self):
+        self.weights = np.ones(3) / 3  # Initialize as a NumPy array
+
+    def fit_weights(self, weights):
+        self.weights = np.array(weights)  # Convert to a NumPy array
+
+    def predict(self, observations):
+        # Check if observations is None
+        if observations is None:
+            # Return default value or handle the case appropriately
+            print("Observations are None.")
+            return np.zeros_like(self.env.observation_space.sample()), None
+
+        # Check if any observation in the list is None
+        if any(observation is None for observation in observations):
+            # Return default value or handle the case appropriately
+            print("One or more observations are None.")
+            return np.zeros_like(self.env.observation_space.sample()), None
+
+        # Extract observations if the input is a DummyVecEnv
+        if isinstance(observations, DummyVecEnv):
+            # Get the first environment from the list
+            env = observations.envs[0].test_env
+
+            # Check if the environment has the 'observation' attribute
+            if hasattr(env, 'observation'):
+                observations = env.get_attr('observation')[0]
+            else:
+                # If 'observation' attribute is not present, return a default value
+                return np.zeros_like(env.observation_space.sample()), None
+
+        # Ensure that observations is a non-empty list
+        if not observations:
+            print("Observations list is empty.")
+            return np.zeros_like(self.env.observation_space.sample()), None
+
+        # Combine predictions using a weighted average
+        if self.weights is None or len(self.weights) != len(observations):
+            # If weights are not provided or have incorrect length, use equal weights
+            weights = list(np.ones(len(observations)) / len(observations))
+        else:
+            weights = self.weights
+        print('Weights before averaging:', weights)
+
+        # Check if any observation in the list is None before averaging
+        if any(observation is None for observation in observations):
+            print("One or more observations are None before averaging.")
+            return np.zeros_like(self.env.observation_space.sample()), None
+
+        weighted_predictions = np.average(observations, axis=0, weights=weights)
+        print('Weighted predictions:', weighted_predictions)
+        return weighted_predictions, observations
+
+    def update_weights(self, a2c_weight, ppo_weight, ddpg_weight):
+        # Update weights based on Sharpe and Sterling ratios
+        total_weight = a2c_weight + ppo_weight + ddpg_weight
+
+        if total_weight == 0:
+            # If total weight is zero, skip the update
+            print('Updated weights:', self.weights)
+            return
+
+        # Normalize weights to sum to 1
+        self.weights = [a2c_weight / total_weight, ppo_weight / total_weight, ddpg_weight / total_weight]
+        print('Updated weights:', self.weights)
+
+class DRLEnsembleAgent:
+    @staticmethod
+    def get_model(
+        model_name,
+        env,
+        policy="MlpPolicy",
+        policy_kwargs=None,
+        model_kwargs=None,
+        seed=None,
+        verbose=1,
+    ):
+        if model_name not in MODELS:
+            raise NotImplementedError("NotImplementedError")
+
+        if model_kwargs is None:
+            temp_model_kwargs = MODEL_KWARGS[model_name]
+        else:
+            temp_model_kwargs = model_kwargs.copy()
+
+        if "action_noise" in temp_model_kwargs:
+            n_actions = env.action_space.shape[-1]
+            temp_model_kwargs["action_noise"] = NOISE[
+                temp_model_kwargs["action_noise"]
+            ](mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions))
+        print(temp_model_kwargs)
+        model = MODELS[model_name](
+            policy=policy,
+            env=env,
+            tensorboard_log=f"{config.TENSORBOARD_LOG_DIR}/{model_name}",
+            verbose=verbose,
+            policy_kwargs=policy_kwargs,
+            seed=seed,
+            **temp_model_kwargs,
+        )
+        return model
+
+    @staticmethod
+    def train_model(
+        model, model_name, tb_log_name, iter_num, total_timesteps=5000, verbose=1
+    ):
+        model = model.learn(
+            total_timesteps=total_timesteps,
+            reset_num_timesteps=False,
+            tb_log_name=tb_log_name,
+            callback=TensorboardCallback(verbose),
+        )
+        model.save(
+            f"{config.TRAINED_MODEL_DIR}/{model_name.upper()}_{total_timesteps//1000}k_{iter_num}"
+        )
+        return model
+
+    @staticmethod
+    def get_validation_sharpe(iteration, model_name):
+        file_path = f"results/account_value_validation_{model_name}_{iteration}.csv"
+        #print(f"Attempting to read file: {file_path}")
+
+        try:
+            df_total_value = pd.read_csv(file_path)
+
+            df_total_value = df_total_value.dropna(subset=['daily_return'])
+
+            std_daily_return = df_total_value["daily_return"].std()
+            std_daily_return = std_daily_return if std_daily_return != 0 else 1e-8
+
+            sharpe = (4**0.5) * df_total_value["daily_return"].mean() / std_daily_return
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            sharpe = None
+        except Exception as e:
+            print(f"Error reading or calculating Sharpe ratio for {model_name} - Iteration {iteration}: {e}")
+            sharpe = None
+
+        return sharpe
+
+    @staticmethod
+    def get_validation_sterling_ratio(iteration, model_name):
+        file_path = f"results/account_value_validation_{model_name}_{iteration}.csv"
+        #print(f"Attempting to read file: {file_path}")
+
+        try:
+            df_total_value = pd.read_csv(file_path)
+
+            df_total_value = df_total_value.dropna(subset=['daily_return'])
+
+            std_daily_return = df_total_value["daily_return"].std()
+            std_daily_return = std_daily_return if std_daily_return != 0 else 1e-8
+
+            annualized_return = (1 + df_total_value["daily_return"].mean()) ** 252 - 1
+
+            cum_returns = (1 + df_total_value["daily_return"]).cumprod()
+            max_drawdown = (cum_returns / cum_returns.cummax() - 1).min()
+
+            if np.isclose(max_drawdown, 0.0):
+                max_drawdown = 1e-8
+
+            sterling_ratio = annualized_return / abs(max_drawdown)
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            sterling_ratio = None
+        except Exception as e:
+            print(f"Error reading or calculating Sterling ratio for {model_name} - Iteration {iteration}: {e}")
+            sterling_ratio = None
+
+        return sterling_ratio
+
+    @staticmethod
+    def data_split(df, start, end, target_date_col="Date"):
+        """
+        split the dataset into training or testing using date
+        :param data: (df) pandas dataframe, start, end
+        :return: (df) pandas dataframe
+        """
+        data = df[(df[target_date_col] >= start) & (df[target_date_col] < end)]
+        data = data.sort_values([target_date_col, "tic"], ignore_index=True)
+        data.index = data[target_date_col].factorize()[0]
+        return data
+    '''
+    def test_ensemble_model(self, model, name, test_data, test_env, test_obs):
+        print('======Testing {}======'.format(name))
+        #print('model.predict(test_env):',model.predict(test_env))
+        # Assuming model.predict returns a NumPy array
+        action_predictions, _states = model.predict(test_env)
+
+        # Reshape the action to match the action space
+        ensemble_action = action_predictions.reshape((1, -1))
+
+        print('Printing action result:', ensemble_action)
+
+        step_result = test_env.step(ensemble_action)
+        test_obs, rewards, dones, _ = step_result[:4]
+        print('Episode Rewards:', rewards )
+        if test_obs is None or dones:
+            # Reset the environment if it's done
+            test_obs = test_env.reset()
+
+        sharpe_ratio = test_obs.get_sharpe_ratio()
+        sterling_ratio = test_obs.calculate_sterling_ratio()
+
+        print("Sharpe Ratio: ", sharpe_ratio)
+        print("Sterling Ratio: ", sterling_ratio)
+
+        return test_obs, rewards, dones
+    '''
+    def test_ensemble_model(self, model, name, test_data,  test_env,test_obs):
+        print('======Testing {}======'.format(name))
+        for i in range(self.validation_window):
+            obs = test_env.reset()
+            dones = False  # Initialize 'dones' variable before the loop
+            observation_data = None  # Initialize observation_data
+            while True:
+                if obs is None:
+                    obs = np.array(obs)
+                    obs = test_env.reset()
+
+                if observation_data is None:  # Check if observation_data is None
+                    observation_data = obs[0]
+                print('observation_data:',observation_data)
+                action, _states = model.predict(observation_data)
+
+                # Clip action to the bounds of the action space
+                action = np.clip(action, test_env.action_space.low, test_env.action_space.high)
+
+                step_result = test_env.step(action)
+                obs, rewards, dones, _ = step_result[:4]
+                #print(f" Action={action}, Reward={rewards}, Done={dones}")
+                #ray.train.report(average_reward=average_reward, max_drawdown=max_drawdown, sharpe_ratio=sharpe_ratio, portfolio_value=portfolio_value,checkpoint="model_weights.h5")
+                # Check if the agent is still in the environment before predicting
+                if obs is None or dones:
+                    print("Environment reset:", obs is None)
+                    print("Episode done:", dones)
+                    break
+
+    def __init__(
+        self,
+        df,
+        stock_dim,
+        hmax,
+        num_stock_shares,
+        initial_amount,
+        commission_per_trade,
+        reward_scaling,
+        state_space,
+        action_space,
+        tech_indicator_list,
+        max_risk_per_trade,
+        min_rr_ratio,
+        train_period,
+        val_test_period,
+        rebalance_window,
+        validation_window,
+        print_verbosity,
+
+    ):
+        self.stock_dim = stock_dim
+        self.hmax = hmax
+        self.num_stock_shares = num_stock_shares
+        self.initial_amount = initial_amount  # get the initial cash
+        self.commission_per_trade = commission_per_trade
+        self.reward_scaling = reward_scaling
+        self.state_space = state_space
+        self.action_space = action_space
+        self.tech_indicator_list = tech_indicator_list
+        self.df = df
+        self.train_period = train_period
+        self.val_test_period = val_test_period
+        self.unique_trade_date = df[
+            (df.Date > val_test_period[0]) & (df.Date <= val_test_period[1])
+        ].Date.unique()
+        self.rebalance_window = rebalance_window
+        self.validation_window = validation_window
+        self.max_risk_per_trade = max_risk_per_trade
+        self.min_rr_ratio = min_rr_ratio
+        self.print_verbosity = print_verbosity
+        self.ensemble_sharpe_list = []
+
+
+    def DRL_validation(self, model, test_data, test_env, test_obs):
+        """Validation process"""
+        try:
+            for i in range(len(test_data.index.unique())):
+                action, _states = model.predict(test_obs)
+                test_obs, rewards, dones, info = test_env.step(action)
+                # Add any additional logging statements here
+                #print(f"Iteration {i}: Action={action}, Reward={rewards}, Done={dones}")
+        except Exception as e:
+            print(f"Error in iteration {i}: {e}")
+
+    def DRL_prediction(
+        self, model, name, last_state, iter_num, turbulence_threshold, initial
+    ):
+        """make a prediction based on trained model"""
+        ## trading env
+        trade_data = self.data_split(
+            self.df,
+            start=self.unique_trade_date[iter_num - self.rebalance_window],
+            end=self.unique_trade_date[iter_num],
+        )
+        trade_env = DummyVecEnv(
+            [
+                lambda: StockTradingEnv(
+                    trade_data,
+                    stock_dim=self.stock_dim,
+                    hmax=self.hmax,
+                    initial_amount=self.initial_amount,
+                    num_stock_shares=self.num_stock_shares,
+                    reward_scaling=self.reward_scaling,
+                    state_space=self.state_space,
+                    action_space=self.action_space,
+                    tech_indicator_list=self.tech_indicator_list,
+                    commission_per_trade=self.commission_per_trade,
+                    min_rr_ratio = self.min_rr_ratio,
+                    max_risk_per_trade = self.max_risk_per_trade,
+                    print_verbosity=self.print_verbosity,
+                    turbulence_threshold=turbulence_threshold,
+                    #initial=initial,
+                    #previous_state=last_state,
+                    model_name=name,
+                    mode="trade",
+                    iteration=iter_num,
+
+                )
+            ]
+        )
+        trade_obs = trade_env.reset()
+        for i in range(len(trade_data.index.unique())):
+            action, _states = model.predict(trade_obs)
+            trade_obs, rewards, dones, info = trade_env.step(action)
+            if i == (len(trade_data.index.unique()) - 2):
+                # print(env_test.render())
+                last_state = trade_env.render()
+
+        last_state = [last_state] if not isinstance(last_state, list) else last_state
+        df_last_state = pd.DataFrame({"last_state": last_state})
+        df_last_state.to_csv(
+            "results/last_state_{}_{}.csv".format(name, i), index=False
+        )
+        print('last_state:',last_state)
+        return last_state
+
+
+    def run_ensemble_strategy(
+        self,
+        rolling_window_size,
+        a2c_model_kwargs,
+        ppo_model_kwargs,
+        ddpg_model_kwargs,
+        timesteps_dict,
+        verbose=True,
+    ):
+
+        """Ensemble Strategy that combines PPO, A2C and DDPG"""
+        print("============Start Ensemble Strategy============")
+        # for ensemble model, it's necessary to feed the last state
+        # of the previous model to the current model as the initial state
+        last_state_ensemble = []
+
+        ppo_sharpe_list = []
+        ddpg_sharpe_list = []
+        a2c_sharpe_list = []
+
+        model_use = []
+        validation_start_date_list = []
+        validation_end_date_list = []
+        iteration_list = []
+        results = []
+
+        ensemble_model = EnsembleModel()
+
+        insample_turbulence = self.df[
+            (self.df.Date < self.train_period[1])
+            & (self.df.Date >= self.train_period[0])
+        ]
+        insample_turbulence_threshold = np.quantile(
+            insample_turbulence.turbulence.values, 0.90
+        )
+
+        start = time.time()
+        #print(' rolling_window_size:', rolling_window_size)
+
+        for i in range(
+        rolling_window_size + self.rebalance_window + self.validation_window,
+        len(self.unique_trade_date),
+        self.rebalance_window,
+            ):
+            validation_start_date = self.unique_trade_date[i - self.rebalance_window - self.validation_window]
+            validation_end_date = self.unique_trade_date[i - self.rebalance_window]
+
+            print("============================================")
+            print(f"Validation Start Date: {validation_start_date}")
+            print(f"Validation End Date: {validation_end_date}")
+
+            validation_start_date_list.append(validation_start_date)
+            validation_end_date_list.append(validation_end_date)
+            iteration_list.append(i)
+
+            # initial state is empty
+            initial = i - self.rebalance_window - self.validation_window == 0
+
+            # Tuning turbulence index based on historical data
+            # Turbulence lookback window is one quarter (63 days)
+            end_date_index = self.df.index[
+                self.df["Date"] == validation_end_date
+            ].to_list()[-1]
+            start_date_index = end_date_index - 63 + 1
+
+            historical_turbulence = self.df.iloc[start_date_index : (end_date_index + 1), :]
+            historical_turbulence = historical_turbulence.drop_duplicates(subset=["Date"])
+            historical_turbulence_mean = np.mean(historical_turbulence.turbulence.values)
+
+            print(f"Historical Turbulence Mean: {historical_turbulence_mean}")
+
+            if historical_turbulence_mean > insample_turbulence_threshold:
+                # if the mean of the historical data is greater than the 90% quantile of insample turbulence data
+                # then we assume that the current market is volatile,
+                # therefore we set the 90% quantile of insample turbulence data as the turbulence threshold
+                # meaning the current turbulence can't exceed the 90% quantile of insample turbulence data
+                turbulence_threshold = insample_turbulence_threshold
+            else:
+                # if the mean of the historical data is less than the 90% quantile of insample turbulence data
+                # then we tune up the turbulence_threshold, meaning we lower the risk
+                turbulence_threshold = np.quantile(
+                    insample_turbulence.turbulence.values, 1
+                )
+
+            turbulence_threshold = np.quantile(
+                insample_turbulence.turbulence.values, 0.99
+            )
+            print("turbulence_threshold: ", turbulence_threshold)
+
+            ############## Environment Setup starts ##############
+            ## training env
+            train = self.data_split(
+                self.df,
+                self.train_period[0],
+                self.unique_trade_date[
+                    i - self.rebalance_window - self.validation_window
+                ],
+            )
+            validation = self.data_split(
+                self.df,
+                self.unique_trade_date[
+                    i - self.rebalance_window - self.validation_window
+                ],
+                self.unique_trade_date[i - self.rebalance_window],
+            )
+            self.train_env = DummyVecEnv(
+                [
+                    lambda: StockTradingEnv(
+                        train,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=self.num_stock_shares,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
+                        commission_per_trade=self.commission_per_trade,
+                        min_rr_ratio = self.min_rr_ratio,
+                        max_risk_per_trade = self.max_risk_per_trade,
+                        print_verbosity=self.print_verbosity,
+                    )
+                ]
+            )
+
+            ############## Environment Setup ends ##############
+
+            ############## Training and Validation starts ##############
+            print(
+                "======Model training from: ",
+                self.train_period[0],
+                "to ",
+                self.unique_trade_date[
+                    i - self.rebalance_window - self.validation_window
+                ],
+            )
+            # print("==============Model Training===========")
+            print("======A2C Training========")
+            model_a2c = self.get_model(
+                "a2c",
+                self.train_env,
+                policy="MlpPolicy",
+                model_kwargs=A2C_model_kwargs,
+                verbose=verbose,
+            )
+
+            model_a2c = self.train_model(
+                model_a2c,
+                "a2c",
+                tb_log_name="a2c_{}".format(i),
+                iter_num=i,
+                total_timesteps=timesteps_dict["a2c"],
+            )  # 100_000
+
+            print(
+                "======A2C Validation from: ",
+                validation_start_date,
+                "to ",
+                validation_end_date,
+            )
+
+            val_env_a2c = DummyVecEnv(
+                [
+                    lambda: StockTradingEnv(
+                        validation,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=self.num_stock_shares,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
+                        commission_per_trade=self.commission_per_trade,
+                        min_rr_ratio = self.min_rr_ratio,
+                        max_risk_per_trade = self.max_risk_per_trade,
+                        print_verbosity=self.print_verbosity,
+                        iteration=i,
+                        model_name="A2C",
+                        mode="validation",
+                    )
+                ]
+            )
+
+            val_obs_a2c = val_env_a2c.reset()
+            self.DRL_validation(
+                model=model_a2c,
+                test_data=validation,
+                test_env=val_env_a2c,
+                test_obs=val_obs_a2c,
+            )
+            '''
+            self.test_ensemble_model(
+                model=model_a2c,
+                name='a2c',
+                test_data=validation,
+                test_env=val_env_a2c,
+                test_obs=val_obs_a2c,
+            )
+            '''
+            sharpe_a2c = self.get_validation_sharpe(i, model_name="A2C")
+            sterling_a2c = self.get_validation_sterling_ratio(i, model_name="A2C")
+            print("A2C Sharpe Ratio: ", sharpe_a2c)
+            print("A2C Sterling Ratio: ", sterling_a2c)
+
+            print("======PPO Training========")
+            model_ppo = self.get_model(
+                "ppo",
+                self.train_env,
+                policy="MlpPolicy",
+                model_kwargs=PPO_model_kwargs,
+                verbose=verbose,
+            )
+            model_ppo = self.train_model(
+                model_ppo,
+                "ppo",
+                tb_log_name="ppo_{}".format(i),
+                iter_num=i,
+                total_timesteps=timesteps_dict["ppo"],
+            )  # 100_000
+            print(
+                "======PPO Validation from: ",
+                validation_start_date,
+                "to ",
+                validation_end_date,
+            )
+            val_env_ppo = DummyVecEnv(
+                [
+                    lambda: StockTradingEnv(
+                        validation,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=self.num_stock_shares,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
+                        commission_per_trade=self.commission_per_trade,
+                        min_rr_ratio = self.min_rr_ratio,
+                        max_risk_per_trade = self.max_risk_per_trade,
+                        print_verbosity=self.print_verbosity,
+                        iteration=i,
+                        model_name="PPO",
+                        mode="validation",
+                    )
+                ]
+            )
+            val_obs_ppo = val_env_ppo.reset()
+            self.DRL_validation(
+                model=model_ppo,
+                test_data=validation,
+                test_env=val_env_ppo,
+                test_obs=val_obs_ppo,
+            )
+
+            sharpe_ppo = self.get_validation_sharpe(i, model_name="PPO")
+            sterling_ppo = self.get_validation_sterling_ratio(i, model_name="PPO")
+            print("PPO Sharpe Ratio: ", sharpe_ppo)
+            print("PPO Sterling Ratio: ", sterling_ppo)
+
+            print("======DDPG Training========")
+            model_ddpg = self.get_model(
+                "ddpg",
+                self.train_env,
+                policy="MlpPolicy",
+                model_kwargs=DDPG_model_kwargs,
+            )
+            model_ddpg = self.train_model(
+                model_ddpg,
+                "ddpg",
+                tb_log_name="ddpg_{}".format(i),
+                iter_num=i,
+                total_timesteps=timesteps_dict["ddpg"],
+                verbose=verbose,
+            )  # 50_000
+            print(
+                "======DDPG Validation from: ",
+                validation_start_date,
+                "to ",
+                validation_end_date,
+            )
+            val_env_ddpg = DummyVecEnv(
+                [
+                    lambda: StockTradingEnv(
+                        validation,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=self.num_stock_shares,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
+                        commission_per_trade=self.commission_per_trade,
+                        min_rr_ratio = self.min_rr_ratio,
+                        max_risk_per_trade = self.max_risk_per_trade,
+                        print_verbosity=self.print_verbosity,
+                        iteration=i,
+                        model_name="DDPG",
+                        mode="validation",
+                    )
+                ]
+            )
+            val_obs_ddpg = val_env_ddpg.reset()
+            self.DRL_validation(
+                model=model_ddpg,
+                test_data=validation,
+                test_env=val_env_ddpg,
+                test_obs=val_obs_ddpg,
+            )
+            sharpe_ddpg = self.get_validation_sharpe(i, model_name="DDPG")
+            sterling_ddpg = self.get_validation_sterling_ratio(i, model_name="DDPG")
+            print("DDPG Sharpe Ratio: ", sharpe_ddpg)
+            print("DDPG Sterling Ratio: ", sterling_ddpg)
+
+            ppo_sharpe_list.append(sharpe_ppo)
+            print('ppo_sharpe_list:',ppo_sharpe_list)
+            a2c_sharpe_list.append(sharpe_a2c)
+            ddpg_sharpe_list.append(sharpe_ddpg)
+
+            # Iterate over the rolling window for assigning weights
+            for j in range(i - rolling_window_size, i, self.rebalance_window):
+                '''
+                # Calculate Sharpe and Sterling ratios for each model in the rolling window
+                a2c_sharpe_rolling = self.get_validation_sharpe(j, model_name="A2C")
+                print('a2c_sharpe_rolling:',a2c_sharpe_rolling)
+                ppo_sharpe_rolling = self.get_validation_sharpe(j, model_name="PPO")
+                print('ppo_sharpe_rolling:',ppo_sharpe_rolling)
+                ddpg_sharpe_rolling = self.get_validation_sharpe(j, model_name="DDPG")
+                print('ddpg_sharpe_rolling:',ddpg_sharpe_rolling)
+
+                a2c_sterling_rolling = self.get_validation_sterling_ratio(j, model_name="A2C")
+                print('a2c_sterling_rolling:',a2c_sterling_rolling)
+                ppo_sterling_rolling = self.get_validation_sterling_ratio(j, model_name="PPO")
+                print('ppo_sterling_rolling:',ppo_sterling_rolling)
+                ddpg_sterling_rolling = self.get_validation_sterling_ratio(j, model_name="DDPG")
+                print('ddpg_sterling_rolling:',ddpg_sterling_rolling)
+
+                # Calculate weights based on Sharpe and Sterling ratios
+                ppo_weight_rolling = ppo_sharpe_rolling * ppo_sterling_rolling
+                a2c_weight_rolling = a2c_sharpe_rolling * a2c_sterling_rolling
+                ddpg_weight_rolling = ddpg_sharpe_rolling * ddpg_sterling_rolling
+                '''
+
+                # Calculate weights based on Sharpe and Sterling ratios
+                ppo_weight_rolling = sharpe_ppo * sterling_ppo
+                a2c_weight_rolling = sharpe_a2c * sterling_a2c
+                ddpg_weight_rolling = sharpe_ddpg * sterling_ddpg
+
+                # Update the ensemble model weights
+                ensemble_model.update_weights(
+                    a2c_weight_rolling, ppo_weight_rolling, ddpg_weight_rolling
+                )
+
+            ############## Training and Validation ends ##############
+            ############## Testing Ensemble starts ##############
+            print(
+                "======Testing Ensemble from: ",
+                self.unique_trade_date[i - self.rebalance_window],
+                "to ",
+                self.unique_trade_date[i],
+            )
+
+            # After obtaining val_obs_a2c, val_obs_ppo, and val_obs_ddpg
+            last_state_ensemble = self.update_ensemble_models(
+                i,
+                model_a2c,
+                model_ppo,
+                model_ddpg,
+                last_state_ensemble,
+                turbulence_threshold,
+                initial,
+                val_obs_a2c=val_obs_a2c,
+                val_obs_ppo=val_obs_ppo,
+                val_obs_ddpg=val_obs_ddpg,
+                ensemble_model=ensemble_model  # Passing ensemble_model as an argument
+            )
+
+            # Test the ensemble model on a separate dataset
+            test_data = self.data_split(
+                self.df,
+                self.unique_trade_date[i - self.rebalance_window],
+                self.unique_trade_date[i],
+            )
+            test_env_ensemble = DummyVecEnv(
+                [
+                    lambda: StockTradingEnv(
+                        test_data,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=self.num_stock_shares,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
+                        commission_per_trade=self.commission_per_trade,
+                        min_rr_ratio=self.min_rr_ratio,
+                        max_risk_per_trade=self.max_risk_per_trade,
+                        print_verbosity=self.print_verbosity,
+                        iteration=i,
+                        model_name="Ensemble",
+                        mode="test",
+                    )
+                ]
+            )
+            test_obs_ensemble = test_env_ensemble.reset()
+            self.test_ensemble_model(
+                model=ensemble_model,
+                name='Ensemble',
+                test_data=test_data,
+                test_env=test_env_ensemble,
+                test_obs=test_obs_ensemble,
+            )
+
+            # Calculate Ensemble Sharpe ratio
+            sharpe_ensemble = self.get_validation_sharpe(i, model_name="Ensemble")
+            sterling_ensemble = self.get_validation_sterling_ratio(i, model_name="Ensemble")
+            print("Ensemble Sharpe Ratio: ", sharpe_ensemble)
+            print("Ensemble Sterling Ratio: ", sterling_ensemble)
+
+        ############## Trading ends ##############
+        end = time.time()
+        print("Ensemble Strategy took: ", (end - start) / 60, " minutes")
+        return df_summary
+
+    def update_ensemble_models(
+    self,
+    iter_num,
+    model_a2c,
+    model_ppo,
+    model_ddpg,
+    last_state_ensemble,
+    turbulence_threshold,
+    initial,
+    val_obs_a2c,
+    val_obs_ppo,
+    val_obs_ddpg,
+    ensemble_model  # Adding ensemble_model as an argument
+    ):
+        print('======Updating ensemble models======')
+        ppo_sharpe = self.get_validation_sharpe(iter_num, model_name="PPO")
+        a2c_sharpe = self.get_validation_sharpe(iter_num, model_name="A2C")
+        ddpg_sharpe = self.get_validation_sharpe(iter_num, model_name="DDPG")
+
+        ppo_sterling = self.get_validation_sterling_ratio(iter_num, model_name="PPO")
+        a2c_sterling = self.get_validation_sterling_ratio(iter_num, model_name="A2C")
+        ddpg_sterling = self.get_validation_sterling_ratio(iter_num, model_name="DDPG")
+
+        print("PPO Sharpe Ratio: ", ppo_sharpe)
+        print("A2C Sharpe Ratio: ", a2c_sharpe)
+        print("DDPG Sharpe Ratio: ", ddpg_sharpe)
+
+         # Check for edge cases
+        if all(weight == 0 for weight in [ppo_sharpe, a2c_sharpe, ddpg_sharpe]):
+            print("All weights are zero. Skipping ensemble update.")
+            return last_state_ensemble
+
+
+        # Define weights
+        ppo_weight = ppo_sharpe * ppo_sterling
+        a2c_weight = a2c_sharpe * a2c_sterling
+        ddpg_weight = ddpg_sharpe * ddpg_sterling
+
+        # Print debugging information
+        print("Weights before normalization:", ppo_weight, a2c_weight, ddpg_weight)
+
+
+        # Normalize weights to sum to 1
+        total_weight = ppo_weight + a2c_weight + ddpg_weight
+
+        # Print debugging information
+        print("Total weight before normalization:", total_weight)
+
+        if total_weight == 0:
+            print("Total weight is zero. Skipping ensemble update.")
+            return last_state_ensemble
+
+        ppo_weight /= total_weight
+        a2c_weight /= total_weight
+        ddpg_weight /= total_weight
+
+        # Combine predictions using weighted average
+        print('======Combining predictions using weighted average======')
+
+        # Print debugging information
+        print("Weights after normalization:", ppo_weight, a2c_weight, ddpg_weight)
+
+        # Fit weights to the ensemble model
+        #ensemble_model.update_weights(a2c_weight, ppo_weight, ddpg_weight)
+        ensemble_model.fit_weights([a2c_weight, ppo_weight, ddpg_weight])
+
+        ensemble_predictions = []
+        for a2c_obs, ppo_obs, ddpg_obs in zip(val_obs_a2c, val_obs_ppo, val_obs_ddpg):
+            combined_obs = ensemble_model.predict([a2c_obs, ppo_obs, ddpg_obs])
+            print('Combined observations before averaging:', combined_obs)
+
+            ensemble_predictions.append(ensemble_model.predict([combined_obs])[0])
+
+        last_state_ensemble = np.mean(ensemble_predictions, axis=0)
+
+        return last_state_ensemble
